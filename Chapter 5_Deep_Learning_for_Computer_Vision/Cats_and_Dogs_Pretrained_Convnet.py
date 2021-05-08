@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Sat May  8 13:19:41 2021
+
+@author: willsteijn
+"""
+
+
+#Using a pretrained convnet
+
+#cats and dogs dataset downloaded from www.kaggle.com/c/dogs-vs-cats/data
+
+#feature extraction
+#consists of using representations learned by a previous network to extract interesting features from new samples
+#these features are then run through a  new classifier, which is trained from scratch
+
+#instantiating the VGG16 convolution base
+from keras.applications import VGG16
+conv_base = VGG16(weights = 'imagenet', include_top = False, input_shape = (150,150,3))
+#weights specifies the weight checkpoint from which to initialize the model
+#include_top refers to including or not including the densely connected classifier on top of the network
+conv_base.summary()
+
+#now can proceed in two ways 
+#   1. run convolutional base over your dataset, record output to a numpy array on disk, then use this data as input to a standalone, densely connected classifier - fast + cheap b/c conv base run only once for every input image
+#   2. extend the conv base model by adding dense layers on top, adn running the whole thing end to end on input data - allows data augmentation b/c the image goes thru the conv base ever time its seen by the model - more expensive
+
+#1. Fast feature extraction w/o data augmentation
+
+#extracting features using the pretrained conv base
+#use ImageDataGenerator to extracting images as Numpy arrays as well as their labels
+#Use predict method from conv_base model to then extract the features 
+import os
+import numpy as np
+from keras.preprocessing.image import ImageDataGenerator
+
+base_dir = 'C:/Users/Will/Downloads/dogs-vs-cats_small'
+train_dir = os.path.join(base_dir, 'train')
+validation_dir = os.path.join(base_dir, 'validation')
+test_dir = os.path.join(base_dir, 'test')
+datagen = ImageDataGenerator(rescale=1./255)
+batch_size = 20
+
+def extract_features(directory, sample_count):
+    features = np.zeros(shape=(sample_count, 4, 4, 512))
+    labels = np.zeros(shape=(sample_count))
+    generator = datagen.flow_from_directory(directory,target_size=(150, 150),batch_size=batch_size,class_mode='binary')
+    i = 0
+    for inputs_batch, labels_batch in generator:
+        features_batch = conv_base.predict(inputs_batch)
+        features[i * batch_size : (i + 1) * batch_size] = features_batch
+        labels[i * batch_size : (i + 1) * batch_size] = labels_batch
+        i += 1
+        if i * batch_size >= sample_count:
+            break #generators yield data indefinitely, so must break after every image has been seen once
+    return features, labels
+
+train_features, train_labels = extract_features(train_dir, 2000)
+validation_features, validation_labels = extract_features(validation_dir, 1000)
+test_features, test_labels = extract_features(test_dir, 1000)
+
+#flatten the features so they can be fed into a densely connected layer
+train_features = np.reshape(train_features, (2000, 4 * 4 * 512))
+validation_features = np.reshape(validation_features, (1000, 4 * 4 * 512))
+test_features = np.reshape(test_features, (1000, 4 * 4 * 512))
+
+
+#define dense classifier, use drop out for regularization
+#define and train the densely connected layer
+from keras import models
+from keras import layers
+from keras import optimizers
+
+model = models.Sequential()
+model.add(layers.Dense(256, activation='relu', input_dim=4 * 4 * 512))
+model.add(layers.Dropout(0.5))
+model.add(layers.Dense(1, activation='sigmoid'))
+model.compile(optimizer=optimizers.RMSprop(lr=2e-5),loss='binary_crossentropy',metrics=['acc'])
+history = model.fit(train_features, train_labels,epochs=30,batch_size=20,validation_data=(validation_features, validation_labels))
+#last epoch val loss = .2384, val acc = .9020
+#plots indicate overfitting from the start, despite large drop out rate
+#this is b/c no data augmentation, which is essential in small image datasets
+
+
+#feature extraction with data augmentation - ONLY WORKS ON GPU
+########################
+
+#DO NOT RUN CODE
+
+#########################
+
+#adding a densely connected classifier on top of the convolutional base
+from keras import models
+from keras import layers
+import matplotlib.pyplot as plt
+
+model = models.Sequential()
+model.add(conv_base)
+model.add(layers.Flatten())
+model.add(layers.Dense(256, activation='relu'))
+model.add(layers.Dense(1, activation='sigmoid')) 
+#VGG16 has 14.7 million parameters- very large
+
+#before compile and train the model - important to freeze conv base
+#allows weights from conv_base to not be modified during training - keeps learned info from conv base
+conv_base.trainable = False
+#now only weights from the two Dense layers that were added will be trained - total of four tensors (2 per layers- the main weight matrix and the bias vector)
+
+#training the model end to end with a frozen conv base
+from keras.preprocessing.image import ImageDataGenerator
+from keras import optimizers
+train_datagen = ImageDataGenerator(rescale=1./255,rotation_range=40,width_shift_range=0.2,height_shift_range=0.2,shear_range=0.2,zoom_range=0.2,horizontal_flip=True,fill_mode='nearest')
+test_datagen = ImageDataGenerator(rescale=1./255)
+train_generator = train_datagen.flow_from_directory(train_dir,target_size=(150, 150),batch_size=20,class_mode='binary')
+validation_generator = test_datagen.flow_from_directory(validation_dir,target_size=(150, 150),batch_size=20,class_mode='binary')
+model.compile(loss='binary_crossentropy',optimizer=optimizers.RMSprop(lr=2e-5),metrics=['acc'])
+history = model.fit_generator(train_generator,steps_per_epoch=100,epochs=30,validation_data=validation_generator,validation_steps=50)
+#achieve about 96% validation accuracy
+
+
+#fine tuning - unfreezing a few of the top layers of a frozen model base used for feature extraction, and jointly training both the newly added part of the model and these top layers
+#this slightly adjusts the more abstract representations of the model being reused, making them more relevant
+#steps:
+#   1. add custom network on top of an already-trained base network    
+#   2. freeze base network
+#   3. train the part you added
+#   4. unfreeze some layers in the base network
+#   5. jointly train both these layers and the part added
+
+#freezing all layers up to a specific one
+conv_base.trainable = True
+set_trainable = False
+for layer in conv_base.layers:
+    if layer.name == 'block5_conv1':
+        set_trainable = True
+    if set_trainable:
+        layer.trainable = True
+    else:
+        layer.trainable = False
+
+#fine-tuning the model
+model.compile(loss='binary_crossentropy',optimizer=optimizers.RMSprop(lr=1e-5),metrics=['acc'])
+history = model.fit_generator(train_generator,steps_per_epoch=100,epochs=100,validation_data=validation_generator,validation_steps=50)
+
+#smoothing the plots
+def smooth_curve(points, factor=0.8):
+    smoothed_points = []
+    for point in points:
+        if smoothed_points:
+            previous = smoothed_points[-1]
+            smoothed_points.append(previous * factor + point * (1 - factor))
+        else:
+            smoothed_points.append(point)
+    return smoothed_points
+plt.plot(epochs,smooth_curve(acc), 'bo', label='Smoothed training acc')
+plt.plot(epochs,smooth_curve(val_acc), 'b', label='Smoothed validation acc')
+plt.title('Training and validation accuracy')
+plt.legend()
+plt.figure()
+plt.plot(epochs,smooth_curve(loss), 'bo', label='Smoothed training loss')
+plt.plot(epochs,smooth_curve(val_loss), 'b', label='Smoothed validation loss')
+plt.title('Training and validation loss')
+plt.legend()
+plt.show()
+
+#test this model on the test data
+test_generator = test_datagen.flow_from_directory(test_dir, target_size = (150,150), batch_size = 20, class_mode = 'binary')
+test_loss, test_acc = model.evaluate_generator(test_generator, steps =50)
+print('test acc:' , test_acc)
+#get 97% accuracy
